@@ -3,10 +3,14 @@ package google
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
+	"net/http/cookiejar"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -14,6 +18,7 @@ import (
 	"cloud.google.com/go/compute/metadata"
 	"github.com/coreos/go-oidc/v3/oidc"
 	"golang.org/x/exp/slices"
+	"golang.org/x/net/publicsuffix"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 	admin "google.golang.org/api/admin/directory/v1"
@@ -22,6 +27,7 @@ import (
 
 	"github.com/dexidp/dex/connector"
 	pkg_groups "github.com/dexidp/dex/pkg/groups"
+	"github.com/dexidp/dex/storage"
 )
 
 const (
@@ -454,4 +460,185 @@ func createDirectoryService(serviceAccountFilePath, email string, logger *slog.L
 	}
 
 	return admin.NewService(ctx, option.WithHTTPClient(config.Client(ctx)))
+}
+
+func (c *googleConnector) ExtendPayload(scopes []string, claims storage.Claims, payload []byte, cdata []byte) ([]byte, error) {
+	email := claims.Email
+	c.logger.Debug("ExtendPayload called", "claims", claims, "payload", string(payload), "email", email)
+
+	// This is how to authenticate with Synology.
+	// First, login to get a session cookie, then use that cookie to get the user list.
+	//   if ! resp=$(curl --cookie-jar /tmp/jar --cookie /tmp/jar -sS 'https://famille.vls.dev/webapi/entry.cgi' \
+	//   	--data-urlencode api=SYNO.API.Auth \
+	//   	--data-urlencode method=login \
+	//   	--data-urlencode version=6 \
+	//   	--data-urlencode account=mael.valais \
+	//   	--data-urlencode passwd="$(lpass show -p famille.vls.dev)"); then
+	//   	echo "Error: curl failed: $resp"
+	//   	exit 1
+	//   fi
+	//   	if ! jq -e '.success' <<<"$resp" >/dev/null; then
+	//   	echo "Error: SYNO.API.Auth failed: $resp"
+	//   	exit 1
+	//   fi
+	//   	jq -r '.' <<<"$resp" >&2
+	//   	if ! resp=$(curl --cookie-jar /tmp/jar --cookie /tmp/jar -sS 'https://famille.vls.dev/webapi/entry.cgi' \
+	//   		--data-urlencode api=SYNO.Core.User \
+	//   		--data-urlencode method=list \
+	//   		--data-urlencode version=1 \
+	//   		--data-urlencode type=local \
+	//   		--data-urlencode offset=0 \
+	//   		--data-urlencode limit=-1 \
+	//   		--data-urlencode additional='["email","description","expired","2fa_status"]'); then
+	//   	echo "Error: curl failed: $resp"
+	//   	exit 1
+	//   fi
+	//   if ! jq -e '.success' <<<"$resp" >/dev/null; then
+	//   	echo "Error: SYNO.Core.User failed: $resp"
+	//   	exit 1
+	//   fi
+	//   jq -r '.' <<<"$resp" >&2
+
+	// First, get the session cookie.
+	jar, err := cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
+	if err != nil {
+		return payload, fmt.Errorf("failed to create cookie jar: %w", err)
+	}
+
+	client := &http.Client{Jar: jar}
+	passwd := os.Getenv("SYNO_PASSWD")
+	if passwd == "" {
+		return payload, errors.New("SYNO_PASSWD not set")
+	}
+
+	user := os.Getenv("SYNO_USER")
+	if user == "" {
+		return payload, errors.New("SYNO_USER not set")
+	}
+
+	// URL-encode the password.
+	form := url.Values{}
+	form.Add("api", "SYNO.API.Auth")
+	form.Add("method", "login")
+	form.Add("version", "6")
+	form.Add("account", user)
+	form.Add("passwd", passwd)
+	req, err := http.NewRequest("POST", "https://famille.vls.dev/webapi/entry.cgi", strings.NewReader(form.Encode()))
+	if err != nil {
+		return payload, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return payload, fmt.Errorf("failed to do request %s: %w", req.URL, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		bytes, _ := io.ReadAll(resp.Body)
+		return payload, fmt.Errorf("unexpected status code: %d, body: %v", resp.StatusCode, string(bytes))
+	}
+
+	// Now, get the user list.
+	form = url.Values{}
+	form.Add("api", "SYNO.Core.User")
+	form.Add("method", "list")
+	form.Add("version", "1")
+	form.Add("type", "local")
+	form.Add("offset", "0")
+	form.Add("limit", "-1")
+	form.Add("additional", `["email","description","expired","2fa_status"]`)
+	req, err = http.NewRequest("POST", "https://famille.vls.dev/webapi/entry.cgi", strings.NewReader(form.Encode()))
+	if err != nil {
+		return payload, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
+	resp, err = client.Do(req)
+	if err != nil {
+		return payload, fmt.Errorf("failed to do request %s: %w", req.URL, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		bytes, _ := io.ReadAll(resp.Body)
+		return payload, fmt.Errorf("unexpected status code: %d, body: %v", resp.StatusCode, string(bytes))
+	}
+
+	// Now, parse the response.
+	bytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return payload, fmt.Errorf("failed to read response: %w", err)
+	}
+
+	// Example:
+	//
+	//    {
+	//      "data": {
+	//        "offset": 0,
+	//        "total": 9,
+	//        "users": [
+	//          {
+	//            "2fa_status": false,
+	//            "description": "Maël Valais",
+	//            "email": "mael.valais@gmail.com",
+	//            "expired": "normal",
+	//            "name": "mael.valais"
+	//        ]
+	//      },
+	//      "success": true
+	//    }
+	type User struct {
+		TwoFAStatus bool   `json:"2fa_status"`
+		Description string `json:"description"`
+		Email       string `json:"email"`
+		Expired     string `json:"expired"`
+		Name        string `json:"name"`
+	}
+	type Data struct {
+		Offset int    `json:"offset"`
+		Total  int    `json:"total"`
+		Users  []User `json:"users"`
+	}
+	type Response struct {
+		Data    Data   `json:"data"`
+		Success bool   `json:"success"`
+		Error   string `json:"error"`
+	}
+
+	var response Response
+	err = json.Unmarshal(bytes, &response)
+	if err != nil {
+		return payload, fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+
+	if !response.Success {
+		return payload, fmt.Errorf("error: %s", response.Error)
+	}
+
+	// Now, search the email in the list of users.
+	var usr User
+	for _, u := range response.Data.Users {
+		if u.Email == email {
+			usr = u
+			break
+		}
+	}
+	if usr == (User{}) {
+		return payload, fmt.Errorf("could not find user with email %s", email)
+	}
+
+	// Now, extend the payload with the user data.
+	var originalClaims map[string]any
+	err = json.Unmarshal(payload, &originalClaims)
+	if err != nil {
+		return payload, fmt.Errorf("failed to unmarshal claims: %w", err)
+	}
+	originalClaims["username"] = usr.Name
+	extendedPayload, err := json.Marshal(originalClaims)
+	if err != nil {
+		return payload, fmt.Errorf("failed to marshal claims: %w", err)
+	}
+	c.logger.Debug("Payload was extended", "payload", extendedPayload)
+	return extendedPayload, nil
 }

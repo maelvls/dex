@@ -453,9 +453,9 @@ func (s *Server) newIDToken(ctx context.Context, clientID string, claims storage
 
 	switch c := conn.Connector.(type) {
 	case connector.PayloadExtender:
-		extendedPayload, err := c.ExtendPayload(scopes, payload, connectorData)
+		extendedPayload, err := c.ExtendPayload(ctx, scopes, claims, payload, connectorData)
 		if err != nil {
-			s.logger.WarnContext(ctx, "failed to enhance payload", "err", err)
+			s.logger.Warn("failed to enhance payload", "err", err.Error())
 			break
 		}
 		payload = extendedPayload
@@ -495,6 +495,7 @@ func (s *Server) parseAuthorizationRequest(r *http.Request) (*storage.AuthReques
 		codeChallengeMethod = codeChallengeMethodPlain
 	}
 
+	s.logger.Debug("oauth2 authorization request sent", "client_id", clientID, "redirect_uri", redirectURI, "state", state, "nonce", nonce, "connector_id", connectorID, "scopes", scopes, "response_types", responseTypes, "code_challenge", codeChallenge, "code_challenge_method", codeChallengeMethod)
 	client, err := s.storage.GetClient(ctx, clientID)
 	if err != nil {
 		if err == storage.ErrNotFound {
