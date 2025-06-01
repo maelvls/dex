@@ -462,7 +462,9 @@ func createDirectoryService(serviceAccountFilePath, email string, logger *slog.L
 	return admin.NewService(ctx, option.WithHTTPClient(config.Client(ctx)))
 }
 
-func (c *googleConnector) ExtendPayload(scopes []string, claims storage.Claims, payload []byte, cdata []byte) ([]byte, error) {
+var _ = (connector.PayloadExtender)(&googleConnector{})
+
+func (c *googleConnector) ExtendPayload(ctx context.Context, scopes []string, claims storage.Claims, payload []byte, cdata []byte) ([]byte, error) {
 	email := claims.Email
 	c.logger.Debug("ExtendPayload called", "claims", claims, "payload", string(payload), "email", email)
 
@@ -523,7 +525,7 @@ func (c *googleConnector) ExtendPayload(scopes []string, claims storage.Claims, 
 	form.Add("version", "6")
 	form.Add("account", user)
 	form.Add("passwd", passwd)
-	req, err := http.NewRequest("POST", "https://famille.vls.dev/webapi/entry.cgi", strings.NewReader(form.Encode()))
+	req, err := http.NewRequestWithContext(ctx, "POST", "https://famille.vls.dev/webapi/entry.cgi", strings.NewReader(form.Encode()))
 	if err != nil {
 		return payload, fmt.Errorf("failed to create request: %w", err)
 	}
@@ -548,7 +550,7 @@ func (c *googleConnector) ExtendPayload(scopes []string, claims storage.Claims, 
 	form.Add("offset", "0")
 	form.Add("limit", "-1")
 	form.Add("additional", `["email","description","expired","2fa_status"]`)
-	req, err = http.NewRequest("POST", "https://famille.vls.dev/webapi/entry.cgi", strings.NewReader(form.Encode()))
+	req, err = http.NewRequestWithContext(ctx, "POST", "https://famille.vls.dev/webapi/entry.cgi", strings.NewReader(form.Encode()))
 	if err != nil {
 		return payload, fmt.Errorf("failed to create request: %w", err)
 	}
