@@ -7,12 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"log/slog"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"cloud.google.com/go/compute/metadata"
@@ -464,9 +466,41 @@ func createDirectoryService(serviceAccountFilePath, email string, logger *slog.L
 
 var _ = (connector.PayloadExtender)(&googleConnector{})
 
-func (c *googleConnector) ExtendPayload(ctx context.Context, scopes []string, claims storage.Claims, payload []byte, cdata []byte) ([]byte, error) {
-	email := claims.Email
-	c.logger.Debug("ExtendPayload called", "claims", claims, "payload", string(payload), "email", email)
+type User struct {
+	TwoFAStatus bool   `json:"2fa_status"`
+	Description string `json:"description"`
+	Email       string `json:"email"`
+	Expired     string `json:"expired"`
+	Name        string `json:"name"`
+}
+
+var mu *sync.Mutex
+var users []User
+
+func init() {
+	mu = &sync.Mutex{}
+
+	// Let's refresh the user list every 10 minutes.
+	go func() {
+		for {
+			ctx := context.Background()
+			list, err := getSynologyUsers(ctx)
+			if err != nil {
+				log.Fatalf("failed to get Synology users: %v", err)
+			}
+
+			mu.Lock()
+			users = list
+			mu.Unlock()
+			log.Printf("Synology users refreshed, found %d users", len(users))
+			time.Sleep(10 * time.Minute)
+		}
+	}()
+}
+
+func getSynologyUsers(ctx context.Context) ([]User, error) {
+	mu.Lock()
+	defer mu.Unlock()
 
 	// This is how to authenticate with Synology.
 	// First, login to get a session cookie, then use that cookie to get the user list.
@@ -504,18 +538,18 @@ func (c *googleConnector) ExtendPayload(ctx context.Context, scopes []string, cl
 	// First, get the session cookie.
 	jar, err := cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
 	if err != nil {
-		return payload, fmt.Errorf("failed to create cookie jar: %w", err)
+		return nil, fmt.Errorf("failed to create cookie jar: %w", err)
 	}
 
 	client := &http.Client{Jar: jar}
 	passwd := os.Getenv("SYNO_PASSWD")
 	if passwd == "" {
-		return payload, errors.New("SYNO_PASSWD not set")
+		return nil, errors.New("SYNO_PASSWD not set")
 	}
 
 	user := os.Getenv("SYNO_USER")
 	if user == "" {
-		return payload, errors.New("SYNO_USER not set")
+		return nil, errors.New("SYNO_USER not set")
 	}
 
 	// URL-encode the password.
@@ -527,18 +561,18 @@ func (c *googleConnector) ExtendPayload(ctx context.Context, scopes []string, cl
 	form.Add("passwd", passwd)
 	req, err := http.NewRequestWithContext(ctx, "POST", "https://famille.vls.dev/webapi/entry.cgi", strings.NewReader(form.Encode()))
 	if err != nil {
-		return payload, fmt.Errorf("failed to create request: %w", err)
+		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return payload, fmt.Errorf("failed to do request %s: %w", req.URL, err)
+		return nil, fmt.Errorf("failed to do request %s: %w", req.URL, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		bytes, _ := io.ReadAll(resp.Body)
-		return payload, fmt.Errorf("unexpected status code: %d, body: %v", resp.StatusCode, string(bytes))
+		return nil, fmt.Errorf("unexpected status code: %d, body: %v", resp.StatusCode, string(bytes))
 	}
 
 	// Now, get the user list.
@@ -552,25 +586,25 @@ func (c *googleConnector) ExtendPayload(ctx context.Context, scopes []string, cl
 	form.Add("additional", `["email","description","expired","2fa_status"]`)
 	req, err = http.NewRequestWithContext(ctx, "POST", "https://famille.vls.dev/webapi/entry.cgi", strings.NewReader(form.Encode()))
 	if err != nil {
-		return payload, fmt.Errorf("failed to create request: %w", err)
+		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
 	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
 	resp, err = client.Do(req)
 	if err != nil {
-		return payload, fmt.Errorf("failed to do request %s: %w", req.URL, err)
+		return nil, fmt.Errorf("failed to do request %s: %w", req.URL, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		bytes, _ := io.ReadAll(resp.Body)
-		return payload, fmt.Errorf("unexpected status code: %d, body: %v", resp.StatusCode, string(bytes))
+		return nil, fmt.Errorf("unexpected status code: %d, body: %v", resp.StatusCode, string(bytes))
 	}
 
 	// Now, parse the response.
 	bytes, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return payload, fmt.Errorf("failed to read response: %w", err)
+		return nil, fmt.Errorf("failed to read response: %w", err)
 	}
 
 	// Example:
@@ -590,49 +624,52 @@ func (c *googleConnector) ExtendPayload(ctx context.Context, scopes []string, cl
 	//      },
 	//      "success": true
 	//    }
-	type User struct {
-		TwoFAStatus bool   `json:"2fa_status"`
-		Description string `json:"description"`
-		Email       string `json:"email"`
-		Expired     string `json:"expired"`
-		Name        string `json:"name"`
-	}
+
 	type Data struct {
 		Offset int    `json:"offset"`
 		Total  int    `json:"total"`
 		Users  []User `json:"users"`
 	}
-	type Response struct {
+
+	var response struct {
 		Data    Data   `json:"data"`
 		Success bool   `json:"success"`
 		Error   string `json:"error"`
 	}
-
-	var response Response
 	err = json.Unmarshal(bytes, &response)
 	if err != nil {
-		return payload, fmt.Errorf("failed to unmarshal response: %w", err)
+		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
 	}
 
 	if !response.Success {
-		return payload, fmt.Errorf("error: %s", response.Error)
+		return nil, fmt.Errorf("error: %s: body: %s", resp.Status, string(bytes))
 	}
+
+	return response.Data.Users, nil
+}
+
+func (c *googleConnector) ExtendPayload(ctx context.Context, scopes []string, claims storage.Claims, payload []byte, cdata []byte) ([]byte, error) {
+	email := claims.Email
+	c.logger.Debug("ExtendPayload called", "claims", claims, "payload", string(payload), "email", email)
 
 	// Now, search the email in the list of users.
 	var usr User
-	for _, u := range response.Data.Users {
+	mu.Lock()
+	for _, u := range users {
 		if u.Email == email {
 			usr = u
 			break
 		}
 	}
+	mu.Unlock()
+
 	if usr == (User{}) {
 		return payload, fmt.Errorf("could not find user with email %s", email)
 	}
 
 	// Now, extend the payload with the user data.
 	var originalClaims map[string]any
-	err = json.Unmarshal(payload, &originalClaims)
+	err := json.Unmarshal(payload, &originalClaims)
 	if err != nil {
 		return payload, fmt.Errorf("failed to unmarshal claims: %w", err)
 	}
