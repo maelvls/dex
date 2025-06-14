@@ -474,28 +474,82 @@ type User struct {
 	Name        string `json:"name"`
 }
 
-var mu *sync.Mutex
-var users []User
+var (
+	mu    *sync.Mutex
+	users []User
+)
 
 func init() {
 	mu = &sync.Mutex{}
 
-	// Let's refresh the user list every 10 minutes.
+	// Let's refresh the user list every hour. Use a backoff strategy in case of
+	// errors.
 	go func() {
+		log.Println("Starting Synology Users refresh loop. This will run every hour.")
 		for {
-			ctx := context.Background()
-			list, err := getSynologyUsers(ctx)
+			var list []User
+			err := retryWithBackoff(10, 5*time.Second, 1*time.Hour, func() error {
+				// If we fail to get the users, we will retry with exponential backoff.
+				var err error
+				ctx := context.Background()
+				list, err = getSynologyUsers(ctx)
+				if isNotRetriable(err) {
+					// Crash to signify to the user that they need to fix the
+					// error.
+					log.Fatalf("non-retryable error while getting Synology users: %v", err)
+				}
+				if err != nil {
+					return fmt.Errorf("while getting Synology users: %w", err)
+				}
+
+				return nil
+			})
 			if err != nil {
-				log.Fatalf("failed to get Synology users: %v", err)
+				log.Printf("failed to get Synology users after retries: %v", err)
+				continue
 			}
 
 			mu.Lock()
 			users = list
 			mu.Unlock()
-			log.Printf("Synology users refreshed, found %d users", len(users))
-			time.Sleep(10 * time.Minute)
+
+			time.Sleep(60 * time.Minute)
 		}
 	}()
+}
+
+// Exponential backoff, no need for jitter.
+func retryWithBackoff(maxRetries int, baseDelay time.Duration, maxDelay time.Duration, fn func() error) error {
+	delay := baseDelay
+
+	for i := range maxRetries {
+		err := fn()
+		if err == nil {
+			return nil
+		}
+
+		// Exponential backoff, no need for jitter.
+		sleep := min(delay, maxDelay)
+
+		fmt.Printf("retry %d failed: %v, sleeping %v\n", i+1, err, sleep)
+		time.Sleep(sleep)
+
+		// Double the delay for next iteration.
+		delay *= 2
+		if delay > maxDelay {
+			delay = maxDelay
+		}
+	}
+
+	return errors.New("all retries failed")
+}
+
+// To know if an error is a retryable error, we can check the error type.
+func isRetryableError(err error) bool {
+	if errors.As(err, &httpErr{}) {
+		return true
+	}
+	return false
 }
 
 func getSynologyUsers(ctx context.Context) ([]User, error) {
@@ -572,7 +626,7 @@ func getSynologyUsers(ctx context.Context) ([]User, error) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		bytes, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("unexpected status code: %d, body: %v", resp.StatusCode, string(bytes))
+		return nil, httpErr{fmt.Errorf("unexpected status code: %d, body: %v", resp.StatusCode, string(bytes)), resp.StatusCode}
 	}
 
 	// Now, get the user list.
@@ -598,7 +652,7 @@ func getSynologyUsers(ctx context.Context) ([]User, error) {
 
 	if resp.StatusCode != http.StatusOK {
 		bytes, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("unexpected status code: %d, body: %v", resp.StatusCode, string(bytes))
+		return nil, httpErr{fmt.Errorf("unexpected status code: %d, body: %v", resp.StatusCode, string(bytes)), resp.StatusCode}
 	}
 
 	// Now, parse the response.
@@ -680,4 +734,35 @@ func (c *googleConnector) ExtendPayload(ctx context.Context, scopes []string, cl
 	}
 	c.logger.Debug("Payload was extended", "payload", extendedPayload)
 	return extendedPayload, nil
+}
+
+type httpErr struct {
+	err  error
+	code int
+}
+
+func (e httpErr) Error() string {
+	return fmt.Sprintf("%d %v", e.code, e.err)
+}
+
+func (e httpErr) Unwrap() error {
+	return e.err
+}
+
+func (e httpErr) Is(target error) bool {
+	if _, ok := target.(httpErr); ok {
+		return true
+	}
+	return false
+}
+
+func isNotRetriable(err error) bool {
+	var httpErr httpErr
+	if errors.As(err, &httpErr) {
+		switch httpErr.code {
+		case http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound, http.StatusMethodNotAllowed, http.StatusConflict, http.StatusGone, http.StatusPreconditionFailed, http.StatusUnprocessableEntity:
+			return true
+		}
+	}
+	return false
 }
