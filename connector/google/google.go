@@ -480,6 +480,26 @@ var (
 )
 
 func init() {
+	passwd := os.Getenv("SYNO_PASSWD")
+	if passwd == "" {
+		panic("SYNO_PASSWD not set, this is required to connect to Synology")
+	}
+
+	user := os.Getenv("SYNO_USER")
+	if user == "" {
+		panic("SYNO_USER not set, this is required to connect to Synology")
+	} else {
+		log.Printf("SYNO_USER was set set '%s', using it to connect to Synology", user)
+	}
+
+	synoURL := os.Getenv("SYNO_URL")
+	if synoURL == "" {
+		log.Println("SYNO_URL not set, defaulting to http://localhost:5000")
+		synoURL = "http://localhost:5000"
+	} else {
+		log.Printf("SYNO_URL was set, using '%s' to connect to Synology", synoURL)
+	}
+
 	mu = &sync.Mutex{}
 
 	// Let's refresh the user list every hour. Use a backoff strategy in case of
@@ -492,7 +512,7 @@ func init() {
 				// If we fail to get the users, we will retry with exponential backoff.
 				var err error
 				ctx := context.Background()
-				list, err = getSynologyUsers(ctx)
+				list, err = getSynologyUsers(ctx, user, passwd, synoURL)
 				if isNotRetriable(err) {
 					// Crash to signify to the user that they need to fix the
 					// error.
@@ -544,50 +564,9 @@ func retryWithBackoff(maxRetries int, baseDelay time.Duration, maxDelay time.Dur
 	return errors.New("all retries failed")
 }
 
-// To know if an error is a retryable error, we can check the error type.
-func isRetryableError(err error) bool {
-	if errors.As(err, &httpErr{}) {
-		return true
-	}
-	return false
-}
-
-func getSynologyUsers(ctx context.Context) ([]User, error) {
+func getSynologyUsers(ctx context.Context, synoUser, synoPasswd, synoURL string) ([]User, error) {
 	mu.Lock()
 	defer mu.Unlock()
-
-	// This is how to authenticate with Synology.
-	// First, login to get a session cookie, then use that cookie to get the user list.
-	//   if ! resp=$(curl --cookie-jar /tmp/jar --cookie /tmp/jar -sS 'https://famille.vls.dev/webapi/entry.cgi' \
-	//   	--data-urlencode api=SYNO.API.Auth \
-	//   	--data-urlencode method=login \
-	//   	--data-urlencode version=6 \
-	//   	--data-urlencode account=mael.valais \
-	//   	--data-urlencode passwd="$(lpass show -p famille.vls.dev)"); then
-	//   	echo "Error: curl failed: $resp"
-	//   	exit 1
-	//   fi
-	//   	if ! jq -e '.success' <<<"$resp" >/dev/null; then
-	//   	echo "Error: SYNO.API.Auth failed: $resp"
-	//   	exit 1
-	//   fi
-	//   	jq -r '.' <<<"$resp" >&2
-	//   	if ! resp=$(curl --cookie-jar /tmp/jar --cookie /tmp/jar -sS 'https://famille.vls.dev/webapi/entry.cgi' \
-	//   		--data-urlencode api=SYNO.Core.User \
-	//   		--data-urlencode method=list \
-	//   		--data-urlencode version=1 \
-	//   		--data-urlencode type=local \
-	//   		--data-urlencode offset=0 \
-	//   		--data-urlencode limit=-1 \
-	//   		--data-urlencode additional='["email","description","expired","2fa_status"]'); then
-	//   	echo "Error: curl failed: $resp"
-	//   	exit 1
-	//   fi
-	//   if ! jq -e '.success' <<<"$resp" >/dev/null; then
-	//   	echo "Error: SYNO.Core.User failed: $resp"
-	//   	exit 1
-	//   fi
-	//   jq -r '.' <<<"$resp" >&2
 
 	// First, get the session cookie.
 	jar, err := cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
@@ -596,24 +575,15 @@ func getSynologyUsers(ctx context.Context) ([]User, error) {
 	}
 
 	client := &http.Client{Jar: jar}
-	passwd := os.Getenv("SYNO_PASSWD")
-	if passwd == "" {
-		return nil, errors.New("SYNO_PASSWD not set")
-	}
-
-	user := os.Getenv("SYNO_USER")
-	if user == "" {
-		return nil, errors.New("SYNO_USER not set")
-	}
 
 	// URL-encode the password.
 	form := url.Values{}
 	form.Add("api", "SYNO.API.Auth")
 	form.Add("method", "login")
 	form.Add("version", "6")
-	form.Add("account", user)
-	form.Add("passwd", passwd)
-	req, err := http.NewRequestWithContext(ctx, "POST", "https://famille.vls.dev/webapi/entry.cgi", strings.NewReader(form.Encode()))
+	form.Add("account", synoUser)
+	form.Add("passwd", synoPasswd)
+	req, err := http.NewRequestWithContext(ctx, "POST", synoURL+"/webapi/entry.cgi", strings.NewReader(form.Encode()))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
@@ -638,7 +608,7 @@ func getSynologyUsers(ctx context.Context) ([]User, error) {
 	form.Add("offset", "0")
 	form.Add("limit", "-1")
 	form.Add("additional", `["email","description","expired","2fa_status"]`)
-	req, err = http.NewRequestWithContext(ctx, "POST", "https://famille.vls.dev/webapi/entry.cgi", strings.NewReader(form.Encode()))
+	req, err = http.NewRequestWithContext(ctx, "POST", synoURL+"/webapi/entry.cgi", strings.NewReader(form.Encode()))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
